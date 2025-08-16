@@ -5,21 +5,52 @@ from typing import Optional, Dict, Any, Tuple, List
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    BufferedInputFile,
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand,
+)
 from aiogram.filters import Command, CommandObject
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.enums.parse_mode import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
+
 import os
 import inspect
+import logging
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+
+# ---------- SAFETY GUARD (NSFW filter for drafts) ----------
+NSFW_REGEX = re.compile(r"(пизд|хуй|еб|минет|секс|порно|вагин|пенис|оральн|анал|сосать|куннилинг|феллаци|эрот|нюд)", re.IGNORECASE)
+
+def is_nsfw(text: str) -> bool:
+    return bool(NSFW_REGEX.search(text or ""))
 
 # ---------- CONFIG ----------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+
+def _parse_admin_ids() -> set[int]:
+    raw = os.getenv("ADMIN_IDS")
+    if raw:
+        ids = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if part.isdigit():
+                ids.add(int(part))
+        return ids
+    # backward compatibility with ADMIN_ID
+    single = os.getenv("ADMIN_ID")
+    if single and single.isdigit():
+        return {int(single)}
+    return set()
+
+ADMIN_IDS = _parse_admin_ids()
 
 # OpenAI client
 from openai import OpenAI, PermissionDeniedError
@@ -31,6 +62,8 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не найден. Заполни .env с BOT_TOKEN=...")
 if not CHANNEL_ID:
     raise RuntimeError("CHANNEL_ID не найден. Укажи @username канала или числовой ID, и сделай бота админом.")
+if not ADMIN_IDS:
+    raise RuntimeError("ADMIN_IDS/ADMIN_ID не задан(ы). Укажи в .env ADMIN_IDS=123,456")
 
 # Инициализация клиента OpenAI по новому SDK (ключ возьмётся из окружения)
 oai = OpenAI()
@@ -72,8 +105,16 @@ DEFAULT_PROFILE = {
         "Пробная тренировка — бесплатно по записи"
     ],
     "brand_words": ["STAVFITNESS26", "сильное тело", "здоровая осанка", "комфортная атмосфера","твоё тело, твоё здоровье, твоя гармония"],
-    "image_style": "светлый зал, натуральный свет, динамика, улыбающиеся люди, 3:4, исключить чернокожих и азиатов"
+    "image_style": "светлый зал, натуральный свет, динамика, улыбающиеся люди, 3:4"
 }
+
+async def migrate_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("PRAGMA table_info(drafts)")
+        cols = [r[1] for r in await cur.fetchall()]
+        if "image_bytes" not in cols:
+            await db.execute("ALTER TABLE drafts ADD COLUMN image_bytes BLOB")
+            await db.commit()
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -85,6 +126,7 @@ async def init_db():
         if not row:
             await db.execute("INSERT INTO studio (id, profile_json) VALUES (1, ?)", (json.dumps(DEFAULT_PROFILE, ensure_ascii=False),))
             await db.commit()
+    await migrate_db()
 
 async def get_profile() -> Dict[str, Any]:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -113,18 +155,26 @@ async def set_daily_time(hhmm: Optional[str]):
             await db.execute("INSERT INTO settings (id, daily_time) VALUES (1, ?)", (hhmm,))
         await db.commit()
 
-async def add_draft(kind: str, text: str, image_prompt: Optional[str]):
+async def add_draft(kind: str, text: str, image_prompt: Optional[str], image_bytes: Optional[bytes] = None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO drafts (kind, text, image_prompt, created_at) VALUES (?, ?, ?, ?)",
-            (kind, text, image_prompt or "", datetime.now().isoformat())
+            "INSERT INTO drafts (kind, text, image_prompt, created_at, image_bytes) VALUES (?, ?, ?, ?, ?)",
+            (kind, text, image_prompt or "", datetime.now().isoformat(), image_bytes)
         )
         await db.commit()
 
-async def get_latest_draft() -> Optional[Tuple[int, str, str, str]]:
+async def get_latest_draft() -> Optional[Tuple[int, str, str, str, Optional[bytes]]]:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id, kind, text, image_prompt FROM drafts ORDER BY id DESC LIMIT 1")
+        cur = await db.execute("SELECT id, kind, text, image_prompt, image_bytes FROM drafts ORDER BY id DESC LIMIT 1")
         return await cur.fetchone()
+
+async def set_draft_image(draft_id: int, image_bytes: Optional[bytes], image_prompt: Optional[str] = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if image_bytes is None:
+            await db.execute("UPDATE drafts SET image_bytes=NULL WHERE id=?", (draft_id,))
+        else:
+            await db.execute("UPDATE drafts SET image_bytes=?, image_prompt=? WHERE id=?", (image_bytes, image_prompt or "", draft_id))
+        await db.commit()
 
 # ---------- OPENAI HELPERS ----------
 GEN_SYSTEM = """Ты — SMM-редактор фитнес-студии. Пишешь короткие сочные посты для Telegram:
@@ -132,6 +182,7 @@ GEN_SYSTEM = """Ты — SMM-редактор фитнес-студии. Пиш�
 — обязательно 1–2 эмодзи в начале абзацев, 3–6 релевантных хештегов в конце;
 — явный CTA: записаться/написать в директ/в Телеграм; без “выкатываем” и канцелярита;
 — не используй markdown ссылки, только текст; без лишних кавычек и CAPS LOCK.
+- обязательно используй слоган: STAVFITNESS26 - твоё тело, твоё здоровье, твоя гармония
 """
 
 def build_user_prompt(profile: Dict[str, Any], kind: str, extra: str = "") -> str:
@@ -192,20 +243,47 @@ async def generate_image_bytes(image_prompt: str) -> Tuple[Optional[bytes], Opti
         return None, f"Ошибка генерации изображения: {e}"
 
 # ---------- UI ----------
-def post_kb():
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+def post_kb(has_image: bool = False):
+    rows = [
         [InlineKeyboardButton(text="✅ Утвердить и опубликовать", callback_data="approve")],
-        [InlineKeyboardButton(text="🎲 Ещё вариант", callback_data="regen"),
-         InlineKeyboardButton(text="✏️ Править", callback_data="edit")],
-        [InlineKeyboardButton(text="🖼 Сгенерить картинку", callback_data="image")]
+        [InlineKeyboardButton(text="🎲 Ещё вариант текста", callback_data="regen"),
+         InlineKeyboardButton(text="✏️ Править", callback_data="edit")]
+    ]
+    if has_image:
+        rows.append([
+            InlineKeyboardButton(text="🖼 Ещё картинка", callback_data="regen_image"),
+            InlineKeyboardButton(text="🗑 Удалить картинку", callback_data="remove_image"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="🖼 Сгенерировать картинку", callback_data="image")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def main_menu_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Сделать черновик"), KeyboardButton(text="Сделать черновик с картинкой")],
+            [KeyboardButton(text="План на неделю"), KeyboardButton(text="Статус")],
+            [KeyboardButton(text="Автопост выкл/вкл")],
+        ],
+        resize_keyboard=True,
+    )
+
+async def setup_bot_commands():
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Запуск бота"),
+        BotCommand(command="menu", description="Показать меню"),
+        BotCommand(command="setup", description="Настроить профиль"),
+        BotCommand(command="draft", description="Сделать черновик"),
+        BotCommand(command="plan_week", description="План на неделю"),
+        BotCommand(command="schedule", description="Автопост ежедневно"),
+        BotCommand(command="status", description="Статус"),
     ])
-    return kb
 
 def only_admin(func):
     async def wrapper(event, *args, **kwargs):
         uid = event.from_user.id if isinstance(event, Message) else event.from_user.id
-        if uid != ADMIN_ID:
-            return await (event.answer if isinstance(event, Message) else event.message.answer)("Доступ только для администратора.")
+        if uid not in ADMIN_IDS:
+            return await (event.answer if isinstance(event, Message) else event.message.answer)("Доступ только для администраторов.")
         # Пропускаем в целевой хэндлер только те kwargs, которые он реально принимает (например, command)
         sig = inspect.signature(func)
         allowed_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
@@ -216,7 +294,107 @@ def only_admin(func):
 @dp.message(Command("start"))
 @only_admin
 async def start_cmd(m: Message, command: CommandObject):
-    await m.answer("Привет! Я SMM‑бот студии. /setup — профиль, /draft — черновик, /schedule HH:MM — автопост, /plan_week — контент‑план, /status.")
+    await m.answer(
+        "Привет! Я SMM‑бот студии. /setup — профиль, /draft — черновик, /schedule HH:MM — автопост, /plan_week — контент‑план, /status.",
+        reply_markup=main_menu_kb(),
+    )
+
+@dp.message(Command("menu"))
+@only_admin
+async def menu_cmd(m: Message):
+    await m.answer("Меню:", reply_markup=main_menu_kb())
+
+@dp.message(F.text == "Сделать черновик")
+@only_admin
+async def _mk_draft(m: Message):
+    await draft_cmd(m, CommandObject(command="draft", args="kind=offer"))
+
+@dp.message(F.text == "Сделать черновик с картинкой")
+@only_admin
+async def _mk_draft_with_img(m: Message):
+    prof = await get_profile()
+    text = await generate_post(prof, "offer", "")
+    await add_draft("offer", text, image_prompt=None, image_bytes=None)
+    await m.answer(f"<b>Черновик (offer):</b>\n\n{text}", reply_markup=post_kb(False))
+
+@dp.message(F.text == "План на неделю")
+@only_admin
+async def _plan_week_btn(m: Message):
+    await plan_week_cmd(m, CommandObject(command="plan_week", args=None))
+
+@dp.message(F.text == "Статус")
+@only_admin
+async def _status_btn(m: Message):
+    await status_cmd(m, CommandObject(command="status", args=None))
+
+@dp.message(F.text == "Автопост выкл/вкл")
+@only_admin
+async def _toggle_autopost(m: Message):
+    cur = await get_daily_time()
+    if cur:
+        await set_daily_time(None); reschedule_daily(None)
+        await m.answer("Ежедневная автопубликация: выключена")
+    else:
+        time_str = "10:00"
+        await set_daily_time(time_str); reschedule_daily(time_str)
+        await m.answer(f"Ежедневная автопубликация: включена ({time_str})")
+
+
+# ---------- Natural language draft handlers ----------
+@dp.message(F.text.regexp(r"^черновик\s+(.+)$", flags=re.IGNORECASE))
+@only_admin
+async def nl_draft_ru(m: Message):
+    theme = m.text.split(None, 1)[1].strip()
+    if is_nsfw(theme):
+        return await m.answer(
+            "Не могу сгенерировать такой текст. Давай сформулируем по-спортивному: например, ‘растяжка приводящих мышц’, ‘наклон вперёд в бабочке’, ‘складка’."
+        )
+    prof = await get_profile()
+    # Привязываем тему к тексту поста и сохраняем её для картинки
+    extra = f"Тема поста: {theme}. Отрази тему в тексте."
+    text = await generate_post(prof, "tip", extra)
+    await add_draft("tip", text, image_prompt=theme, image_bytes=None)
+    await m.answer(f"<b>Черновик (tip):</b>\n\n{text}", reply_markup=post_kb(False))
+
+
+@dp.message(F.text.regexp(r"^draft\s+(.+)$", flags=re.IGNORECASE))
+@only_admin
+async def nl_draft_en(m: Message):
+    theme = m.text.split(None, 1)[1].strip()
+    if is_nsfw(theme):
+        return await m.answer(
+            "I can’t generate explicit content. Please rephrase in a sports/fitness way, e.g., ‘adductor stretch’, ‘seated butterfly forward fold’, ‘hamstring fold’."
+        )
+    prof = await get_profile()
+    extra = f"Post theme: {theme}. Reflect the theme in the text."
+    text = await generate_post(prof, "tip", extra)
+    await add_draft("tip", text, image_prompt=theme, image_bytes=None)
+    await m.answer(f"<b>Draft (tip):</b>\n\n{text}", reply_markup=post_kb(False))
+
+# ---------- Natural language ANY-TEXT → draft ----------
+@dp.message(
+    F.text &
+    F.text.regexp(r"^(?!/).+") &
+    ~F.text.in_({
+        "Сделать черновик",
+        "Сделать черновик с картинкой",
+        "План на неделю",
+        "Статус",
+        "Автопост выкл/вкл",
+    })
+)
+@only_admin
+async def nl_draft_any(m: Message):
+    theme = m.text.strip()
+    if is_nsfw(theme):
+        return await m.answer(
+            "Не могу сгенерировать такой текст. Перефразируй по‑спортивному (например: ‘растяжка приводящих’, ‘наклон в бабочке’, ‘складка’)."
+        )
+    prof = await get_profile()
+    extra = f"Тема поста: {theme}. Отрази тему в тексте."
+    text = await generate_post(prof, "tip", extra)
+    await add_draft("tip", text, image_prompt=theme, image_bytes=None)
+    await m.answer(f"<b>Черновик (tip):</b>\n\n{text}", reply_markup=post_kb(False))
 
 @dp.message(Command("setup"))
 @only_admin
@@ -266,9 +444,13 @@ async def draft_cmd(m: Message, command: CommandObject):
                 kind = part.split("=",1)[1].strip()
             elif part.startswith("extra="):
                 extra = part.split("=",1)[1].strip()
+    # NSFW guard for theme/extra
+    theme = extra if extra else ""
+    if 'theme' in locals() and theme and is_nsfw(theme):
+        return await m.answer("Тема содержит неприемлемые выражения. Перефразируй в спортивных терминах (например: ‘растяжка приводящих’, ‘наклон в бабочке’, ‘складка’).")
     text = await generate_post(prof, kind, extra)
-    await add_draft(kind, text, image_prompt=None)
-    await m.answer(f"<b>Черновик ({kind}):</b>\n\n{text}", reply_markup=post_kb())
+    await add_draft(kind, text, image_prompt=(extra or None), image_bytes=None)
+    await m.answer(f"<b>Черновик ({kind}):</b>\n\n{text}", reply_markup=post_kb(False))
 
 @dp.message(Command("schedule"))
 @only_admin
@@ -299,8 +481,8 @@ async def plan_week_cmd(m: Message, command: CommandObject):
     await m.answer("Генерю 7 черновиков на неделю…")
     for k in kinds:
         text = await generate_post(prof, k, "")
-        await add_draft(k, text, image_prompt=None)
-        await m.answer(f"<b>Черновик ({k}):</b>\n\n{text}", reply_markup=post_kb())
+        await add_draft(k, text, image_prompt=None, image_bytes=None)
+        await m.answer(f"<b>Черновик ({k}):</b>\n\n{text}", reply_markup=post_kb(False))
 
 @dp.message(Command("status"))
 @only_admin
@@ -318,27 +500,27 @@ async def status_cmd(m: Message, command: CommandObject):
     )
 
 # ---------- CALLBACKS ----------
-@dp.callback_query(F.data.in_({"approve","regen","edit","image"}))
+@dp.callback_query(F.data.in_({"approve","regen","edit","image","regen_image","remove_image"}))
 async def on_cb(q: CallbackQuery):
-    if q.from_user.id != ADMIN_ID:
+    if q.from_user.id not in ADMIN_IDS:
         return await q.answer("Только админ.", show_alert=True)
     draft = await get_latest_draft()
     if not draft:
         return await q.message.answer("Нет черновика.")
-    draft_id, kind, text, image_prompt = draft
+    draft_id, kind, text, image_prompt, image_bytes = draft
 
     # Immediately answer the callback to avoid timeout
     await _safe_cb_answer(q, "⏳ Обрабатываю…")
 
     if q.data == "approve":
-        await publish_to_channel(text, None)
+        await publish_to_channel(text, image_bytes if image_bytes else None)
         return await q.message.answer("Опубликовано ✅")
 
     if q.data == "regen":
         prof = await get_profile()
         new_text = await generate_post(prof, kind, "сделай другой угол и подачу")
-        await add_draft(kind, new_text, image_prompt=None)
-        return await q.message.answer(f"<b>Черновик ({kind}) — новый вариант:</b>\n\n{new_text}", reply_markup=post_kb())
+        await add_draft(kind, new_text, image_prompt=None, image_bytes=None)
+        return await q.message.answer(f"<b>Черновик ({kind}) — новый вариант:</b>\n\n{new_text}", reply_markup=post_kb(False))
 
     if q.data == "edit":
         await q.message.answer("Пришли новый текст одним сообщением. Я опубликую его.")
@@ -347,15 +529,39 @@ async def on_cb(q: CallbackQuery):
 
     if q.data == "image":
         prof = await get_profile()
-        img_prompt = f"Фитнес-студия {prof['name']}, {prof['image_style']}. Акцент: {', '.join(prof['services'][:2])}"
+        theme_text = f" Тема: {image_prompt}." if image_prompt else ""
+        img_prompt = (
+            f"Фитнес-студия {prof['name']}. Стиль: {prof['image_style']}. "
+            f"Акцент: {', '.join(prof['services'][:2])}." + theme_text
+        )
+        if image_prompt and is_nsfw(image_prompt):
+            return await q.message.answer("Тема черновика содержит неприемлемые формулировки для изображения. Перефразируй, и попробуем снова.")
         data, err = await generate_image_bytes(img_prompt)
         if err:
-            await publish_to_channel(text, None)
-            return await q.message.answer("Пост без картинки опубликован ✅\n\n" + err)
+            return await q.message.answer("Не удалось добавить картинку:\n\n" + err)
         if not data:
-            return await q.answer("Не удалось сгенерировать изображение", show_alert=True)
-        await publish_to_channel(text, data)
-        return await q.message.answer("Пост с картинкой опубликован ✅")
+            return await q.message.answer("Не удалось сгенерировать изображение")
+        await set_draft_image(draft_id, data, img_prompt)
+        return await q.message.answer_photo(photo=BufferedInputFile(data, filename="preview.png"), caption=text, reply_markup=post_kb(True))
+
+    if q.data == "regen_image":
+        prof = await get_profile()
+        theme_text = f" Тема: {image_prompt}." if image_prompt else ""
+        img_prompt = (
+            f"Фитнес-студия {prof['name']}. Стиль: {prof['image_style']}. "
+            f"Акцент: {', '.join(prof['services'][:2])}." + theme_text
+        )
+        if image_prompt and is_nsfw(image_prompt):
+            return await q.message.answer("Тема черновика содержит неприемлемые формулировки для изображения. Перефразируй, и попробуем снова.")
+        data, err = await generate_image_bytes(img_prompt)
+        if err or not data:
+            return await q.message.answer("Не удалось обновить картинку." + (f"\n\n{err}" if err else ""))
+        await set_draft_image(draft_id, data, img_prompt)
+        return await q.message.answer_photo(photo=BufferedInputFile(data, filename="preview.png"), caption=text, reply_markup=post_kb(True))
+
+    if q.data == "remove_image":
+        await set_draft_image(draft_id, None)
+        return await q.message.answer(f"<b>Черновик ({kind}) без картинки:</b>\n\n{text}", reply_markup=post_kb(False))
 
 async def one_shot_publish(m: Message):
     # снимаем хэндлер сразу после использования
@@ -376,6 +582,31 @@ async def publish_to_channel(text: str, image_bytes: Optional[bytes]):
 
 
 # ---------- HELPERS ----------
+
+# Middleware to print user info for every update
+class LogUserIdMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        try:
+            user = None
+            if isinstance(event, Message) and event.from_user:
+                user = event.from_user
+            elif isinstance(event, CallbackQuery) and event.from_user:
+                user = event.from_user
+            if user is not None:
+                print(
+                    f"[USER] id={user.id} name={user.full_name} username=@{user.username}",
+                    flush=True,
+                )
+                logging.info(
+                    "USER id=%s name=%s username=@%s",
+                    user.id,
+                    user.full_name,
+                    user.username,
+                )
+        except Exception as e:
+            logging.debug("LogUserIdMiddleware error: %s", e)
+        return await handler(event, data)
+
 # Helper to safely answer callback queries (avoid late answer errors)
 async def _safe_cb_answer(q: CallbackQuery, text: str | None = None, show_alert: bool = False):
     try:
@@ -405,6 +636,10 @@ async def scheduled_job():
 # ---------- ENTRY ----------
 async def main():
     await init_db()
+    await setup_bot_commands()
+    dp.update.middleware(LogUserIdMiddleware())
+    dp.message.middleware(LogUserIdMiddleware())
+    dp.callback_query.middleware(LogUserIdMiddleware())
     # поднимем планировщик с текущим временем из БД
     hhmm = await get_daily_time()
     reschedule_daily(hhmm)
